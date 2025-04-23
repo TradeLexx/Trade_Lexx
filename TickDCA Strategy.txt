@@ -1,0 +1,244 @@
+// © Advanced DCA Strategy with Tick-based Calculations
+// This strategy uses tick-based calculations for DCA while executing trades on higher timeframes
+
+//@version=6
+strategy("TickDCA Strategy", shorttitle="TickDCA", overlay=true, calc_on_every_tick=true, pyramiding=50, default_qty_type=strategy.fixed, default_qty_value=1, initial_capital=10000, commission_type=strategy.commission.percent, commission_value=0.1)
+
+// Strategy Type Selection
+strategyType = input.string("Both", title="Trading Direction", options=["Long", "Short", "Both"], group="Strategy Settings")
+
+// DCA Settings
+firstOrderSize = input.float(100, title="First Order Size", minval=0.1, group="DCA Settings")
+safetyOrderSize = input.float(200, title="Safety Order Size", minval=0.1, group="DCA Settings")
+takeProfitPercent = input.float(1.0, title="Take Profit %", minval=0.1, step=0.1, group="DCA Settings") / 100
+stopLossPercent = input.float(5.0, title="Stop Loss %", minval=0.1, step=0.1, group="DCA Settings") / 100
+maxSafetyOrders = input.int(6, title="Max Safety Orders", minval=1, maxval=50, group="DCA Settings")
+priceDeviation = input.float(0.5, title="Price Deviation %", minval=0.1, step=0.1, group="DCA Settings") / 100
+deviationStepScale = input.float(1.2, title="Deviation Step Scale", minval=1.0, step=0.1, group="DCA Settings")
+volumeScale = input.float(1.5, title="Volume Scale (Martingale)", minval=1.0, step=0.1, group="DCA Settings")
+
+// External Signal
+useExternalSignal = input.bool(true, title="Use External Signal", group="Signal Settings")
+externalSignalSource = input.source(0, title="External Signal Source", group="Signal Settings")
+
+// Information Display
+showInfoTable = input.bool(true, title="Show Info Table", group="Display Settings")
+showSafetyLevels = input.bool(true, title="Show Safety Order Levels", group="Display Settings")
+tablePosition = input.string("bottom_right", title="Table Position", options=["top_left", "top_right", "bottom_left", "bottom_right"], group="Display Settings")
+
+// Variables for position tracking
+var float entryPrice = 0.0
+var int safetyOrdersPlaced = 0
+var float averageEntryPrice = 0.0
+var float totalInvestment = 0.0
+var float positionSize = 0.0
+var bool inPosition = false
+var string positionType = "None"
+
+// Function to calculate the next safety order deviation
+safetyOrderDeviation(index) =>
+    priceDeviation * math.pow(deviationStepScale, index - 1)
+
+// Function to calculate safety order size with martingale
+safetyOrderSizeWithScale(index) =>
+    safetyOrderSize * math.pow(volumeScale, index - 1)
+
+// Function to calculate the price level for a safety order
+safetyOrderLevel(basePrice, index, isLong) =>
+    deviation = safetyOrderDeviation(index)
+    isLong ? basePrice * (1 - deviation) : basePrice * (1 + deviation)
+
+// Calculate price levels for all safety orders
+calcSafetyLevels(basePrice, isLong) =>
+    levels = array.new_float(maxSafetyOrders)
+    for i = 0 to maxSafetyOrders - 1
+        level = safetyOrderLevel(basePrice, i + 1, isLong)
+        array.set(levels, i, level)
+    levels
+
+// Calculate safety order volumes
+calcSafetyVolumes() =>
+    vol_array = array.new_float(maxSafetyOrders)
+    for i = 0 to maxSafetyOrders - 1
+        so_size = safetyOrderSizeWithScale(i + 1)
+        array.set(vol_array, i, so_size)
+    vol_array
+
+// Get signals from external source
+longSignal = externalSignalSource == 1 and useExternalSignal
+shortSignal = externalSignalSource == -1 and useExternalSignal
+
+// Process signals based on strategy type
+validLongSignal = (strategyType == "Long" or strategyType == "Both") and longSignal
+validShortSignal = (strategyType == "Short" or strategyType == "Both") and shortSignal
+
+// Entry conditions
+if (not inPosition and validLongSignal)
+    strategy.entry("Long Entry", strategy.long, qty=firstOrderSize/close)
+    entryPrice := close
+    inPosition := true
+    positionType := "Long"
+    safetyOrdersPlaced := 0
+    totalInvestment := firstOrderSize
+    positionSize := firstOrderSize/close
+    averageEntryPrice := close
+
+if (not inPosition and validShortSignal)
+    strategy.entry("Short Entry", strategy.short, qty=firstOrderSize/close)
+    entryPrice := close
+    inPosition := true
+    positionType := "Short"
+    safetyOrdersPlaced := 0
+    totalInvestment := firstOrderSize
+    positionSize := firstOrderSize/close
+    averageEntryPrice := close
+
+// Safety orders logic for long positions
+if (inPosition and positionType == "Long")
+    longLevels = calcSafetyLevels(entryPrice, true)
+    longVolumes = calcSafetyVolumes()
+    
+    for i = 0 to maxSafetyOrders - 1
+        if (safetyOrdersPlaced <= i and close <= array.get(longLevels, i))
+            orderSize = array.get(longVolumes, i) / close
+            strategy.entry("Long SO" + str.tostring(i+1), strategy.long, qty=orderSize)
+            safetyOrdersPlaced := math.max(safetyOrdersPlaced, i + 1)
+            newInvestment = array.get(longVolumes, i)
+            totalInvestment := totalInvestment + newInvestment
+            positionSize := positionSize + orderSize
+            averageEntryPrice := totalInvestment / positionSize
+
+    // Take profit for long
+    if (close >= averageEntryPrice * (1 + takeProfitPercent))
+        strategy.close_all(comment="TP Long")
+        inPosition := false
+        positionType := "None"
+    
+    // Stop loss for long based on the last safety order or entry price
+    stopLevel = safetyOrdersPlaced > 0 ? array.get(longLevels, safetyOrdersPlaced - 1) * (1 - stopLossPercent) : entryPrice * (1 - stopLossPercent)
+    
+    if (close <= stopLevel)
+        strategy.close_all(comment="SL Long")
+        inPosition := false
+        positionType := "None"
+
+// Safety orders logic for short positions
+if (inPosition and positionType == "Short")
+    shortLevels = calcSafetyLevels(entryPrice, false)
+    shortVolumes = calcSafetyVolumes()
+    
+    for i = 0 to maxSafetyOrders - 1
+        if (safetyOrdersPlaced <= i and close >= array.get(shortLevels, i))
+            orderSize = array.get(shortVolumes, i) / close
+            strategy.entry("Short SO" + str.tostring(i+1), strategy.short, qty=orderSize)
+            safetyOrdersPlaced := math.max(safetyOrdersPlaced, i + 1)
+            newInvestment = array.get(shortVolumes, i)
+            totalInvestment := totalInvestment + newInvestment
+            positionSize := positionSize + orderSize
+            averageEntryPrice := totalInvestment / positionSize
+
+    // Take profit for short
+    if (close <= averageEntryPrice * (1 - takeProfitPercent))
+        strategy.close_all(comment="TP Short")
+        inPosition := false
+        positionType := "None"
+    
+    // Stop loss for short based on the last safety order or entry price
+    stopLevel = safetyOrdersPlaced > 0 ? array.get(shortLevels, safetyOrdersPlaced - 1) * (1 + stopLossPercent) : entryPrice * (1 + stopLossPercent)
+    
+    if (close >= stopLevel)
+        strategy.close_all(comment="SL Short")
+        inPosition := false
+        positionType := "None"
+
+// Create safety order level plots
+var longSafetyLevels = array.new_float(maxSafetyOrders, 0.0)
+var shortSafetyLevels = array.new_float(maxSafetyOrders, 0.0)
+
+// Update safety order levels when in position
+if inPosition
+    if positionType == "Long"
+        longSafetyLevels := calcSafetyLevels(entryPrice, true)
+    if positionType == "Short"
+        shortSafetyLevels := calcSafetyLevels(entryPrice, false)
+
+// Plot long safety order levels
+plot(inPosition and positionType == "Long" and showSafetyLevels ? array.get(longSafetyLevels, 0) : na, title="Long SO1", color=color.new(color.green, 0), style=plot.style_cross)
+plot(inPosition and positionType == "Long" and showSafetyLevels and maxSafetyOrders >= 2 ? array.get(longSafetyLevels, 1) : na, title="Long SO2", color=color.new(color.green, 0), style=plot.style_cross)
+plot(inPosition and positionType == "Long" and showSafetyLevels and maxSafetyOrders >= 3 ? array.get(longSafetyLevels, 2) : na, title="Long SO3", color=color.new(color.green, 0), style=plot.style_cross)
+plot(inPosition and positionType == "Long" and showSafetyLevels and maxSafetyOrders >= 4 ? array.get(longSafetyLevels, 3) : na, title="Long SO4", color=color.new(color.green, 0), style=plot.style_cross)
+plot(inPosition and positionType == "Long" and showSafetyLevels and maxSafetyOrders >= 5 ? array.get(longSafetyLevels, 4) : na, title="Long SO5", color=color.new(color.green, 0), style=plot.style_cross)
+plot(inPosition and positionType == "Long" and showSafetyLevels and maxSafetyOrders >= 6 ? array.get(longSafetyLevels, 5) : na, title="Long SO6", color=color.new(color.green, 0), style=plot.style_cross)
+
+// Plot short safety order levels
+plot(inPosition and positionType == "Short" and showSafetyLevels ? array.get(shortSafetyLevels, 0) : na, title="Short SO1", color=color.new(color.red, 0), style=plot.style_cross)
+plot(inPosition and positionType == "Short" and showSafetyLevels and maxSafetyOrders >= 2 ? array.get(shortSafetyLevels, 1) : na, title="Short SO2", color=color.new(color.red, 0), style=plot.style_cross)
+plot(inPosition and positionType == "Short" and showSafetyLevels and maxSafetyOrders >= 3 ? array.get(shortSafetyLevels, 2) : na, title="Short SO3", color=color.new(color.red, 0), style=plot.style_cross)
+plot(inPosition and positionType == "Short" and showSafetyLevels and maxSafetyOrders >= 4 ? array.get(shortSafetyLevels, 3) : na, title="Short SO4", color=color.new(color.red, 0), style=plot.style_cross)
+plot(inPosition and positionType == "Short" and showSafetyLevels and maxSafetyOrders >= 5 ? array.get(shortSafetyLevels, 4) : na, title="Short SO5", color=color.new(color.red, 0), style=plot.style_cross)
+plot(inPosition and positionType == "Short" and showSafetyLevels and maxSafetyOrders >= 6 ? array.get(shortSafetyLevels, 5) : na, title="Short SO6", color=color.new(color.red, 0), style=plot.style_cross)
+
+// Plot average entry and take profit/stop loss levels
+plot(inPosition ? averageEntryPrice : na, title="Average Entry", color=color.white, style=plot.style_linebr, linewidth=2)
+
+// Long TP and SL levels
+var float longStopLevel = na
+var float longTpLevel = na
+
+if (inPosition and positionType == "Long")
+    longTpLevel := averageEntryPrice * (1 + takeProfitPercent)
+    longStopLevel := safetyOrdersPlaced > 0 ? array.get(calcSafetyLevels(entryPrice, true), safetyOrdersPlaced - 1) * (1 - stopLossPercent) : entryPrice * (1 - stopLossPercent)
+
+plot(longTpLevel, title="TP Long", color=color.green, style=plot.style_linebr, linewidth=2)
+plot(longStopLevel, title="SL Long", color=color.red, style=plot.style_linebr, linewidth=2)
+
+// Short TP and SL levels
+var float shortStopLevel = na
+var float shortTpLevel = na
+
+if (inPosition and positionType == "Short")
+    shortTpLevel := averageEntryPrice * (1 - takeProfitPercent)
+    shortStopLevel := safetyOrdersPlaced > 0 ? array.get(calcSafetyLevels(entryPrice, false), safetyOrdersPlaced - 1) * (1 + stopLossPercent) : entryPrice * (1 + stopLossPercent)
+
+plot(shortTpLevel, title="TP Short", color=color.green, style=plot.style_linebr, linewidth=2)
+plot(shortStopLevel, title="SL Short", color=color.red, style=plot.style_linebr, linewidth=2)
+
+// Information table
+var table infoTable = table.new(tablePosition == "top_right" ? position.top_right : tablePosition == "top_left" ? position.top_left : tablePosition == "bottom_left" ? position.bottom_left : position.bottom_right, columns=2, rows=10, bgcolor=color.rgb(0, 0, 0, 80), border_width=1)
+
+if (showInfoTable)
+    table.cell(infoTable, 0, 0, "Position", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.white)
+    table.cell(infoTable, 1, 0, positionType, bgcolor=color.rgb(38, 38, 38, 80), text_color=positionType == "Long" ? color.green : positionType == "Short" ? color.red : color.gray)
+    
+    table.cell(infoTable, 0, 1, "Entry Price", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.white)
+    table.cell(infoTable, 1, 1, inPosition ? str.tostring(entryPrice, "#.####") : "N/A", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.white)
+    
+    table.cell(infoTable, 0, 2, "Average Price", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.white)
+    table.cell(infoTable, 1, 2, inPosition ? str.tostring(averageEntryPrice, "#.####") : "N/A", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.white)
+    
+    table.cell(infoTable, 0, 3, "Safety Orders", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.white)
+    table.cell(infoTable, 1, 3, str.tostring(safetyOrdersPlaced) + "/" + str.tostring(maxSafetyOrders), bgcolor=color.rgb(38, 38, 38, 80), text_color=color.white)
+    
+    table.cell(infoTable, 0, 4, "Position Size", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.white)
+    table.cell(infoTable, 1, 4, inPosition ? str.tostring(positionSize, "#.####") : "N/A", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.white)
+    
+    table.cell(infoTable, 0, 5, "Total Investment", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.white)
+    table.cell(infoTable, 1, 5, inPosition ? str.tostring(totalInvestment, "#.##") : "N/A", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.white)
+    
+    table.cell(infoTable, 0, 6, "Current PnL %", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.white)
+    currentPnL = inPosition ? (positionType == "Long" ? (close/averageEntryPrice - 1) * 100 : (averageEntryPrice/close - 1) * 100) : 0.0
+    table.cell(infoTable, 1, 6, inPosition ? str.tostring(currentPnL, "#.##") + "%" : "N/A", bgcolor=color.rgb(38, 38, 38, 80), text_color=currentPnL > 0 ? color.green : currentPnL < 0 ? color.red : color.white)
+    
+    table.cell(infoTable, 0, 7, "Take Profit", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.white)
+    table.cell(infoTable, 1, 7, str.tostring(takeProfitPercent * 100, "#.##") + "%", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.green)
+    
+    table.cell(infoTable, 0, 8, "Stop Loss", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.white)
+    table.cell(infoTable, 1, 8, str.tostring(stopLossPercent * 100, "#.##") + "%", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.red)
+    
+    table.cell(infoTable, 0, 9, "Net Profit", bgcolor=color.rgb(38, 38, 38, 80), text_color=color.white)
+    netProfit = strategy.netprofit
+    table.cell(infoTable, 1, 9, str.tostring(netProfit, "#.##"), bgcolor=color.rgb(38, 38, 38, 80), text_color=netProfit > 0 ? color.green : netProfit < 0 ? color.red : color.white)
+
+// Alert for external signal changes
+alertcondition(longSignal, title="Long Signal", message="Long signal received")
+alertcondition(shortSignal, title="Short Signal", message="Short signal received") 
