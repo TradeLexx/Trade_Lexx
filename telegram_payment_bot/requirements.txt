@@ -1,0 +1,5 @@
+python-telegram-bot
+SQLAlchemy
+alembic
+python-dotenv
+apscheduler
